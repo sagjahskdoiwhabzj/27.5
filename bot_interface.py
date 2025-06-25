@@ -304,6 +304,7 @@ async def update_user_session_cache(user_id: int):
     try:
         user_session = await db.load_user_session(user_id)
         user_sessions_cache[user_id] = user_session
+        logger.info(f"Кеш сессии обновлен для пользователя {user_id}: {user_session}")
     except Exception as e:
         logger.error(f"Ошибка обновления кеша сессии для пользователя {user_id}: {e}")
 
@@ -692,10 +693,16 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
 
 Добро пожаловать! Выберите действие:"""
     
-    # Получаем состояние пользователя асинхронно
+    # ИСПРАВЛЕНИЕ: используем кеш вместо загрузки из БД
     try:
-        user_session = await db.load_user_session(user_id)
-        logger.info(f"Главное меню - загружена сессия пользователя {user_id}: {user_session}")
+        if user_id in user_sessions_cache:
+            user_session = user_sessions_cache[user_id]
+            logger.info(f"Главное меню - используем данные из кеша для пользователя {user_id}: {user_session}")
+        else:
+            user_session = await db.load_user_session(user_id)
+            # Обновляем кеш
+            user_sessions_cache[user_id] = user_session
+            logger.info(f"Главное меню - загружена сессия пользователя {user_id}: {user_session}")
         
         has_client = user_session.get('has_active_client', False)
         client_config = user_session.get('client_config', {})
@@ -703,14 +710,14 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         
         logger.info(f"Главное меню - состояние для пользователя {user_id}: has_client={has_client}, config_present={bool(client_config)}, is_running={is_running}")
         
-        # ИСПРАВЛЕНИЕ: дополнительная проверка наличия конфигурации
+        # Проверяем что все необходимые данные есть
         if has_client and client_config:
-            # Проверяем что все необходимые данные есть
-            if not (client_config.get('api_id') and client_config.get('api_hash') and client_config.get('phone')):
-                logger.warning(f"Неполная конфигурация клиента для пользователя {user_id}, сбрасываем флаг")
-                has_client = False
-                user_session['has_active_client'] = False
-                await db.save_user_session(user_id, user_session)
+            required_fields = ['api_id', 'api_hash', 'phone']
+            missing_fields = [field for field in required_fields if not client_config.get(field)]
+            
+            if missing_fields:
+                logger.warning(f"Неполная конфигурация клиента для пользователя {user_id}, отсутствуют поля: {missing_fields}")
+                has_client = False  # Локально меняем для отображения
         
         logger.info(f"Главное меню - финальное состояние для пользователя {user_id}: has_client={has_client}, is_running={is_running}")
         
@@ -774,19 +781,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         else:
             await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
-async def debug_user_session(user_id: int):
-    """Отладка сессии пользователя"""
-    try:
-        session_data = await db.load_user_session(user_id)
-        logger.info(f"[DEBUG] Полная сессия пользователя {user_id}: {session_data}")
-        
-        # Прямой запрос к базе данных
-        from database import db
-        raw_data = await db.load_user_session(user_id)
-        logger.info(f"[DEBUG] Сырые данные из БД для пользователя {user_id}: {raw_data}")
-        
-    except Exception as e:
-        logger.error(f"[DEBUG] Ошибка проверки сессии пользователя {user_id}: {e}")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user_id = update.effective_user.id
@@ -1376,17 +1370,18 @@ async def handle_telegram_password(update: Update, context: ContextTypes.DEFAULT
         
         session_data['client_config'] = config
         session_data['has_active_client'] = True
+        session_data['state'] = 'main_menu'  # ИСПРАВЛЕНИЕ: сбрасываем состояние
         
         # Принудительно сохраняем сессию
         await db.save_user_session(user_id, session_data)
         logger.info(f"Конфигурация клиента сохранена для пользователя {user_id}")
         
+        # ИСПРАВЛЕНИЕ: обновляем кеш ПОСЛЕ сохранения
+        await update_user_session_cache(user_id)
+        
         # Проверяем что сохранилось
         saved_session = await db.load_user_session(user_id)
         logger.info(f"Проверка сохранения конфигурации клиента: {saved_session}")
-        
-        # Обновляем кеш
-        await update_user_session_cache(user_id)
         
         await client.disconnect()
         
@@ -1519,17 +1514,18 @@ async def process_telegram_code(update: Update, context: ContextTypes.DEFAULT_TY
         
         session_data['client_config'] = config
         session_data['has_active_client'] = True
+        session_data['state'] = 'main_menu'  # ИСПРАВЛЕНИЕ: сбрасываем состояние
         
         # Принудительно сохраняем сессию
         await db.save_user_session(user_id, session_data)
         logger.info(f"Конфигурация клиента сохранена для пользователя {user_id}")
         
+        # ИСПРАВЛЕНИЕ: обновляем кеш ПОСЛЕ сохранения
+        await update_user_session_cache(user_id)
+        
         # Проверяем что сохранилось
         saved_session = await db.load_user_session(user_id)
         logger.info(f"Проверка сохранения конфигурации клиента: {saved_session}")
-        
-        # Обновляем кеш
-        await update_user_session_cache(user_id)
         
         await client.disconnect()
         
@@ -1551,7 +1547,7 @@ async def process_telegram_code(update: Update, context: ContextTypes.DEFAULT_TY
         )
         context.user_data['setup_step'] = 'password'
         bot_data['user_states'][user_id] = 'password'
-        asyncio.create_task(save_bot_state())
+        # НЕ вызываем save_bot_state() здесь
         return
         
     except PhoneCodeInvalidError:
@@ -1580,7 +1576,7 @@ async def process_telegram_code(update: Update, context: ContextTypes.DEFAULT_TY
             )
             context.user_data['setup_step'] = 'password'
             bot_data['user_states'][user_id] = 'password'
-            asyncio.create_task(save_bot_state())
+            # НЕ вызываем save_bot_state() здесь
             return
         
         keyboard = [[get_back_button()]]
@@ -1794,10 +1790,14 @@ async def toggle_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Доступ ограничен", show_alert=True)
         return
     
-    # ОТЛАДКА: проверяем что в базе данных
-    await debug_user_session(user_id)
+    # ИСПРАВЛЕНИЕ: используем кеш вместо загрузки из БД
+    if user_id in user_sessions_cache:
+        user_session = user_sessions_cache[user_id].copy()
+        logger.info(f"Используем данные из кеша для пользователя {user_id}: {user_session}")
+    else:
+        user_session = await db.load_user_session(user_id)
+        logger.info(f"Загружаем данные из БД для пользователя {user_id}: {user_session}")
     
-    user_session = await db.load_user_session(user_id)
     is_running = user_session.get('is_running', False)
     has_active_client = user_session.get('has_active_client', False)
     client_config = user_session.get('client_config', {})
@@ -1820,36 +1820,23 @@ async def toggle_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка остановки сервисов для пользователя {user_id}: {e}")
     else:
-        # ИСПРАВЛЕНИЕ: проверяем наличие конфигурации клиента вместо создания нового соединения
-        if not has_active_client or not client_config or not client_config.get('api_id') or not client_config.get('api_hash') or not client_config.get('phone'):
+        # Проверяем наличие активного клиента и конфигурации
+        if not has_active_client or not client_config:
             logger.warning(f"Пользователь {user_id} не имеет активного клиента или конфигурации")
             keyboard = [[get_back_button()]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text("❌ Сначала добавьте аккаунт", reply_markup=reply_markup)
             return
         
-        # Дополнительная проверка: пытаемся создать клиент только для проверки
-        try:
-            test_client = await get_user_telethon_client(user_id)
-            if test_client:
-                await test_client.disconnect()
-                logger.info(f"Проверка клиента для пользователя {user_id} успешна")
-            else:
-                logger.error(f"Не удалось создать клиент для пользователя {user_id}")
-                # Сбрасываем флаг активного клиента при неудачной проверке
-                user_session['has_active_client'] = False
-                await db.save_user_session(user_id, user_session)
-                keyboard = [[get_back_button()]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text("❌ Ошибка авторизации. Добавьте аккаунт заново", reply_markup=reply_markup)
-                return
-        except Exception as e:
-            logger.error(f"Ошибка проверки клиента для пользователя {user_id}: {e}")
-            user_session['has_active_client'] = False
-            await db.save_user_session(user_id, user_session)
+        # Проверяем наличие всех необходимых полей в конфигурации
+        required_fields = ['api_id', 'api_hash', 'phone']
+        missing_fields = [field for field in required_fields if not client_config.get(field)]
+        
+        if missing_fields:
+            logger.warning(f"Пользователь {user_id} имеет неполную конфигурацию. Отсутствуют поля: {missing_fields}")
             keyboard = [[get_back_button()]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text("❌ Ошибка авторизации. Добавьте аккаунт заново", reply_markup=reply_markup)
+            await query.edit_message_text("❌ Конфигурация аккаунта неполная. Добавьте аккаунт заново", reply_markup=reply_markup)
             return
         
         user_session['is_running'] = True
@@ -2778,30 +2765,96 @@ async def remove_user_telethon_client(user_id: int):
 async def start_user_services(user_id: int):
     """Запуск сервисов для конкретного пользователя"""
     try:
-        user_session = await db.load_user_session(user_id)
-        user_settings = user_session.get('settings', bot_data['settings'])
+        if user_id not in user_sessions_cache:
+            logger.error(f"Нет данных сессии для пользователя {user_id}")
+            return
+            
+        user_session = user_sessions_cache[user_id]
+        client_config = user_session.get('client_config', {})
         
+        if not client_config or not all(client_config.get(field) for field in ['api_id', 'api_hash', 'phone']):
+            logger.error(f"Неполная конфигурация клиента для пользователя {user_id}")
+            return
+        
+        # Создаем клиент для пользователя
         client = await get_user_telethon_client(user_id)
         if not client:
-            logger.error(f"Не удалось получить клиент для пользователя {user_id}")
+            logger.error(f"Не удалось создать клиент для пользователя {user_id}")
             return
+        
+        # Получаем настройки пользователя или используем глобальные
+        user_settings = user_session.get('settings', bot_data['settings'])
         
         try:
             import channel_search_engine
             await channel_search_engine.start_search(user_settings, client, user_id)
+            logger.info(f"Поисковик запущен для пользователя {user_id}")
         except Exception as e:
             logger.error(f"Ошибка запуска поисковика для пользователя {user_id}: {e}")
         
         try:
             import masslooker
             asyncio.create_task(masslooker.start_masslooking(client, user_settings, user_id))
+            logger.info(f"Масслукер запущен для пользователя {user_id}")
         except Exception as e:
             logger.error(f"Ошибка запуска масслукера для пользователя {user_id}: {e}")
         
-        await client.disconnect()
+        # НЕ отключаем клиент здесь, он нужен для работы сервисов
         
     except Exception as e:
         logger.error(f"Ошибка запуска сервисов для пользователя {user_id}: {e}")
+
+async def get_user_telethon_client(user_id: int) -> Optional[TelegramClient]:
+    """Получение Telethon клиента для конкретного пользователя"""
+    try:
+        if user_id not in user_sessions_cache:
+            logger.debug(f"Нет данных сессии в кеше для пользователя {user_id}")
+            return None
+            
+        session_data = user_sessions_cache[user_id]
+        client_config = session_data.get('client_config')
+        
+        if not client_config:
+            logger.debug(f"Нет конфигурации клиента для пользователя {user_id}")
+            return None
+            
+        if not all(key in client_config for key in ['api_id', 'api_hash', 'phone']):
+            logger.debug(f"Неполная конфигурация клиента для пользователя {user_id}")
+            return None
+        
+        # Проверяем что api_id является числом
+        try:
+            api_id = int(client_config['api_id'])
+        except (ValueError, TypeError):
+            logger.error(f"Неверный формат API ID для пользователя {user_id}")
+            return None
+            
+        session_file = f'user_session_{user_id}'
+        loop = asyncio.get_event_loop()
+        
+        client = TelegramClient(
+            session_file,
+            api_id,
+            client_config['api_hash'],
+            loop=loop,
+            timeout=30,
+            retry_delay=1,
+            flood_sleep_threshold=60
+        )
+        
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            logger.info(f"Клиент для пользователя {user_id} создан и авторизован")
+            return client
+        else:
+            await client.disconnect()
+            logger.debug(f"Клиент для пользователя {user_id} не авторизован")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка получения клиента для пользователя {user_id}: {e}")
+        return None
 
 async def stop_user_services(user_id: int):
     """Остановка сервисов для конкретного пользователя"""
